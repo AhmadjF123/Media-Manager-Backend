@@ -1,6 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose");
-const cors = require("cors"); // ⬅️ تمت إضافة CORS
+const cors = require("cors");
+const compression = require("compression"); // ✅ لضغط الاستجابات
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,22 +19,23 @@ mongoose
     process.exit(1);
   });
 
-// ==================== Mongoose Schemas ====================
+// ==================== Mongoose Schemas with Indexes ====================
+// إضافة فهارس لتسريع البحث
 const movieSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  genre: { type: String, required: true },
-  release_year: { type: Number, required: true },
-  rating: { type: Number, default: 0 },
+  title: { type: String, required: true, index: true },
+  genre: { type: String, required: true, index: true },
+  release_year: { type: Number, required: true, index: true },
+  rating: { type: Number, default: 0, index: true },
   poster_url: { type: String, default: null },
   order_number: { type: Number, required: true, default: 0 },
 });
 
 const seriesSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  genre: { type: String, required: true },
-  release_year: { type: Number, required: true },
+  title: { type: String, required: true, index: true },
+  genre: { type: String, required: true, index: true },
+  release_year: { type: Number, required: true, index: true },
   end_year: { type: Number, default: null },
-  rating: { type: Number, default: 0 },
+  rating: { type: Number, default: 0, index: true },
   poster_url: { type: String, default: null },
   order_number: { type: Number, required: true, default: 0 },
 });
@@ -42,21 +44,56 @@ const Movie = mongoose.model("Movie", movieSchema);
 const Series = mongoose.model("Series", seriesSchema);
 
 // ==================== Middleware ====================
-app.use(express.json());
-app.use(cors()); // ⬅️ السماح بجميع الطلبات عبر النطاقات (ضروري للاتصال من Vercel)
+app.use(compression()); // ضغط الاستجابات
+app.use(express.json({ limit: "1mb" })); // تحديد حجم الطلبات
+app.use(cors());
 
-// (اختياري) إذا أردت الاحتفاظ بخدمة الملفات الثابتة، يمكنك إضافة السطر التالي، لكنه غير ضروري بعد الفصل.
-// app.use(express.static(path.join(__dirname, "public")));
+// تخزين الملفات الثابتة مؤقتاً (إذا كنت تخدمها من الخادم نفسه)
+// app.use(express.static("public", { maxAge: "1h" }));
 
 // ==================== API Routes ====================
 
-// GET /api/media?type=movie|series
+// ✅ نقطة نهاية واحدة تجلب جميع الوسائط مع إمكانية البحث والتصفية
+app.get("/api/media/all", async (req, res) => {
+  const { search, by, type } = req.query; // type: movie/series/all
+  let filter = {};
+
+  // بناء فلتر البحث
+  if (search && by) {
+    if (by === "title") filter.title = { $regex: search, $options: "i" };
+    else if (by === "genre") filter.genre = { $regex: search, $options: "i" };
+    else if (by === "release_year") filter.release_year = parseInt(search);
+    else if (by === "rating") filter.rating = parseFloat(search);
+  }
+
+  try {
+    let movies = [],
+      series = [];
+    if (type === "all" || type === "movie") {
+      movies = await Movie.find(filter).sort("order_number").lean();
+    }
+    if (type === "all" || type === "series") {
+      series = await Series.find(filter).sort("order_number").lean();
+    }
+
+    // توحيد النتائج مع إضافة media_type
+    const results = [
+      ...movies.map((m) => ({ ...m, media_type: "movie" })),
+      ...series.map((s) => ({ ...s, media_type: "series" })),
+    ].sort((a, b) => a.order_number - b.order_number);
+
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/media?type=movie|series (يبقى للتوافق مع الكود القديم)
 app.get("/api/media", async (req, res) => {
   const { type } = req.query;
   const Model = type === "movie" ? Movie : Series;
-
   try {
-    const items = await Model.find().sort("order_number");
+    const items = await Model.find().sort("order_number").lean();
     res.json(items);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -67,19 +104,12 @@ app.get("/api/media", async (req, res) => {
 app.post("/api/media", async (req, res) => {
   const { type, data } = req.body;
   const Model = type === "movie" ? Movie : Series;
-
   try {
-    // Get the current maximum order_number
     const lastItem = await Model.findOne().sort("-order_number");
     const newOrder = lastItem ? lastItem.order_number + 1 : 1;
-
-    const newItem = new Model({
-      ...data,
-      order_number: newOrder,
-    });
-
+    const newItem = new Model({ ...data, order_number: newOrder });
     await newItem.save();
-    res.json({ success: true });
+    res.json({ success: true, order_number: newOrder });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -88,13 +118,10 @@ app.post("/api/media", async (req, res) => {
 // PUT /api/media → edit an item
 app.put("/api/media", async (req, res) => {
   const { type, order_number, data } = req.body;
-
   if (!type || !order_number || !data) {
     return res.status(400).json({ error: "Invalid request data" });
   }
-
   const Model = type === "movie" ? Movie : Series;
-
   try {
     const item = await Model.findOne({ order_number });
     if (!item) {
@@ -102,7 +129,6 @@ app.put("/api/media", async (req, res) => {
         .status(404)
         .json({ error: `Item not found with order number ${order_number}` });
     }
-
     await Model.updateOne({ order_number }, data);
     res.json({ success: true });
   } catch (err) {
@@ -114,17 +140,14 @@ app.put("/api/media", async (req, res) => {
 app.delete("/api/media", async (req, res) => {
   const { type, order_number } = req.body;
   const Model = type === "movie" ? Movie : Series;
-
   try {
     await Model.deleteOne({ order_number });
-
     // Reorder remaining items
     const remaining = await Model.find().sort("order_number");
     for (let i = 0; i < remaining.length; i++) {
       remaining[i].order_number = i + 1;
       await remaining[i].save();
     }
-
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -136,7 +159,6 @@ app.get("/debug", async (req, res) => {
   try {
     const movies = await Movie.find().limit(5);
     const series = await Series.find().limit(5);
-
     res.json({
       status: "connected",
       movies_sample: movies,
@@ -146,11 +168,6 @@ app.get("/debug", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// (اختياري) يمكن حذف هذا المسار إذا لم تعد بحاجة لخدمة index.html
-// app.get("/", (req, res) => {
-//   res.send("Backend is running. Use /api/media endpoints.");
-// });
 
 // ==================== Start Server ====================
 app.listen(PORT, () => {
