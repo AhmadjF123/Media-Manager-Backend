@@ -142,11 +142,16 @@ app.delete("/api/media", async (req, res) => {
   const Model = type === "movie" ? Movie : Series;
   try {
     await Model.deleteOne({ order_number });
-    // Reorder remaining items
-    const remaining = await Model.find().sort("order_number");
-    for (let i = 0; i < remaining.length; i++) {
-      remaining[i].order_number = i + 1;
-      await remaining[i].save();
+    // Reorder remaining items in one bulk operation
+    const remaining = await Model.find().sort("order_number").lean();
+    if (remaining.length > 0) {
+      const bulkOps = remaining.map((item, i) => ({
+        updateOne: {
+          filter: { _id: item._id },
+          update: { $set: { order_number: i + 1 } },
+        },
+      }));
+      await Model.bulkWrite(bulkOps);
     }
     res.json({ success: true });
   } catch (err) {
