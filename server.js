@@ -33,24 +33,36 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model("User", userSchema);
 
 const movieSchema = new mongoose.Schema({
-  user_id:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-  title:        { type: String, required: true, index: true },
-  genre:        { type: String, required: true, index: true },
-  release_year: { type: Number, required: true, index: true },
-  rating:       { type: Number, default: 0, index: true },
-  poster_url:   { type: String, default: null },
-  order_number: { type: Number, required: true, default: 0 },
+  user_id:       { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  title:         { type: String, required: true, index: true },
+  genre:         { type: String, required: true, index: true },
+  release_year:  { type: Number, required: true, index: true },
+  rating:        { type: Number, default: 0, index: true },
+  poster_url:    { type: String, default: null },
+  order_number:  { type: Number, required: true, default: 0 },
+  // ── Personal fields (optional) ──
+  notes:         { type: String, default: null },
+  watch_status:  { type: String, enum: ["watched", "watching", "plan_to_watch", "dropped", null], default: null },
+  watch_date:    { type: Date, default: null },
+  favorite:      { type: Boolean, default: false },
+  rewatch_count: { type: Number, default: 0 },
 });
 
 const seriesSchema = new mongoose.Schema({
-  user_id:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-  title:        { type: String, required: true, index: true },
-  genre:        { type: String, required: true, index: true },
-  release_year: { type: Number, required: true, index: true },
-  end_year:     { type: Number, default: null },
-  rating:       { type: Number, default: 0, index: true },
-  poster_url:   { type: String, default: null },
-  order_number: { type: Number, required: true, default: 0 },
+  user_id:       { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  title:         { type: String, required: true, index: true },
+  genre:         { type: String, required: true, index: true },
+  release_year:  { type: Number, required: true, index: true },
+  end_year:      { type: Number, default: null },
+  rating:        { type: Number, default: 0, index: true },
+  poster_url:    { type: String, default: null },
+  order_number:  { type: Number, required: true, default: 0 },
+  // ── Personal fields (optional) ──
+  notes:         { type: String, default: null },
+  watch_status:  { type: String, enum: ["watched", "watching", "plan_to_watch", "dropped", null], default: null },
+  watch_date:    { type: Date, default: null },
+  favorite:      { type: Boolean, default: false },
+  rewatch_count: { type: Number, default: 0 },
 });
 
 const Movie  = mongoose.model("Movie",  movieSchema);
