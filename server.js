@@ -68,6 +68,76 @@ const seriesSchema = new mongoose.Schema({
 const Movie  = mongoose.model("Movie",  movieSchema);
 const Series = mongoose.model("Series", seriesSchema);
 
+// ==================== Sorting Helpers ====================
+// Supported query values:
+//   sort_by: order_number | added | title | release_year | year | rating
+//   sort_order: asc | desc
+const MEDIA_SORT_ALIASES = {
+  added: "_id",
+  order_number: "order_number",
+  title: "title",
+  year: "release_year",
+  release_year: "release_year",
+  rating: "rating",
+};
+
+const mediaTitleCollator = new Intl.Collator(undefined, {
+  sensitivity: "base",
+  numeric: true,
+});
+
+function parseMediaSort(query = {}) {
+  const field = MEDIA_SORT_ALIASES[query.sort_by] || "order_number";
+  const order = String(query.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
+  return {
+    field,
+    order,
+    direction: order === "desc" ? -1 : 1,
+  };
+}
+
+function getMediaAddedTime(item) {
+  if (item.created_at) {
+    const createdAt = new Date(item.created_at).getTime();
+    if (Number.isFinite(createdAt)) return createdAt;
+  }
+
+  if (item._id && typeof item._id.getTimestamp === "function") {
+    return item._id.getTimestamp().getTime();
+  }
+
+  const objectId = String(item._id || "");
+  if (/^[a-f0-9]{24}$/i.test(objectId)) {
+    return parseInt(objectId.slice(0, 8), 16) * 1000;
+  }
+
+  return Number(item.order_number) || 0;
+}
+
+function compareMediaValues(a, b, field) {
+  if (field === "title") {
+    return mediaTitleCollator.compare(String(a.title || ""), String(b.title || ""));
+  }
+  if (field === "_id") {
+    return getMediaAddedTime(a) - getMediaAddedTime(b);
+  }
+
+  const aValue = Number(a[field]) || 0;
+  const bValue = Number(b[field]) || 0;
+  return aValue - bValue;
+}
+
+function sortMediaResults(items, field, direction) {
+  return items.sort((a, b) => {
+    const primary = compareMediaValues(a, b, field);
+    if (primary !== 0) return primary * direction;
+
+    // Stable, deterministic order when two titles share the same value.
+    const tie = (Number(a.order_number) || 0) - (Number(b.order_number) || 0);
+    return tie * direction;
+  });
+}
+
 // ==================== Middleware ====================
 app.use(compression());
 app.use(express.json({ limit: "1mb" }));
@@ -155,9 +225,10 @@ app.get("/api/auth/me", authMiddleware, (req, res) => {
 
 // ==================== Media Routes (auth required) ====================
 
-// GET /api/media/all — fetch all user's media with search/filter
+// GET /api/media/all — fetch all user's media with search/filter/sorting
 app.get("/api/media/all", authMiddleware, async (req, res) => {
-  const { search, by, type } = req.query;
+  const { search, by, type = "all" } = req.query;
+  const { field: sortField, order: sortOrder, direction } = parseMediaSort(req.query);
   const baseFilter = { user_id: req.userId };
   let filter = { ...baseFilter };
 
@@ -170,30 +241,41 @@ app.get("/api/media/all", authMiddleware, async (req, res) => {
 
   try {
     let movies = [], series = [];
+    const dbSort = { [sortField]: direction, order_number: direction };
+
     if (type === "all" || type === "movie") {
-      movies = await Movie.find(filter).sort("order_number").lean();
+      movies = await Movie.find(filter).sort(dbSort).lean();
     }
     if (type === "all" || type === "series") {
-      series = await Series.find(filter).sort("order_number").lean();
+      series = await Series.find(filter).sort(dbSort).lean();
     }
 
-    const results = [
+    const results = sortMediaResults([
       ...movies.map((m) => ({ ...m, media_type: "movie" })),
       ...series.map((s) => ({ ...s, media_type: "series" })),
-    ].sort((a, b) => a.order_number - b.order_number);
+    ], sortField, direction);
 
+    res.set("X-Media-Sort", `${sortField}:${sortOrder}`);
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/media — legacy endpoint (with auth)
+// GET /api/media — legacy endpoint (with auth + sorting)
 app.get("/api/media", authMiddleware, async (req, res) => {
   const { type } = req.query;
+  const { field: sortField, order: sortOrder, direction } = parseMediaSort(req.query);
   const Model = type === "movie" ? Movie : Series;
+
   try {
-    const items = await Model.find({ user_id: req.userId }).sort("order_number").lean();
+    const items = await Model.find({ user_id: req.userId })
+      .sort({ [sortField]: direction, order_number: direction })
+      .lean();
+
+    // Apply the same case-insensitive title ordering used by the combined route.
+    sortMediaResults(items, sortField, direction);
+    res.set("X-Media-Sort", `${sortField}:${sortOrder}`);
     res.json(items);
   } catch (err) {
     res.status(500).json({ error: err.message });
