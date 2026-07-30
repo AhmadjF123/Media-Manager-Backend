@@ -1,7 +1,7 @@
 {
   "name": "media-manager",
-  "version": "2.1.0",
-  "description": "Movie & Series Manager - indexed, cached Node.js backend with Auth",
+  "version": "3.0.0",
+  "description": "Movie & Series Manager with indexed media, unique handles, friends, invites and private sharing",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
