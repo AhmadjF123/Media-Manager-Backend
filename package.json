@@ -1,11 +1,12 @@
 {
   "name": "media-manager",
-  "version": "2.0.0",
-  "description": "Movie & Series Manager - Node.js Backend with Auth",
+  "version": "2.1.0",
+  "description": "Movie & Series Manager - indexed, cached Node.js backend with Auth",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "indexes": "node create-indexes.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -17,5 +18,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
