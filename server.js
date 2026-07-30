@@ -75,7 +75,10 @@ function createMediaSchema(extraFields = {}) {
 }
 
 const movieSchema = createMediaSchema();
-const seriesSchema = createMediaSchema({ end_year: { type: Number, default: null } });
+const seriesSchema = createMediaSchema({
+  end_year: { type: Number, default: null },
+  number_of_seasons: { type: Number, min: 1, default: null },
+});
 
 const User = mongoose.model("User", userSchema);
 const Movie = mongoose.model("Movie", movieSchema);
@@ -392,7 +395,7 @@ function sanitizeMediaData(data = {}, type) {
     "favorite",
     "rewatch_count",
   ];
-  if (type === "series") allowed.push("end_year");
+  if (type === "series") allowed.push("end_year", "number_of_seasons");
   return Object.fromEntries(allowed.filter((key) => Object.hasOwn(data, key)).map((key) => [key, data[key]]));
 }
 
