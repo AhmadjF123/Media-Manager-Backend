@@ -412,7 +412,7 @@ cacheCleanupTimer.unref();
 app.disable("x-powered-by");
 app.set("etag", "strong");
 app.use(compression({ threshold: 512 }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "4mb" }));
 app.use(cors());
 app.use((req, res, next) => {
   res.set("Vary", "Authorization");
@@ -1019,6 +1019,12 @@ app.get("/api/media", authMiddleware, async (req, res) => {
 });
 
 function sanitizeMediaData(data = {}, type) {
+  if (Object.hasOwn(data, "poster_url") && data.poster_url != null) {
+    const poster = String(data.poster_url)
+    const allowedPoster = /^https?:\/\//i.test(poster) || /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(poster)
+    if (!allowedPoster || poster.length > 1500000) data.poster_url = null
+  }
+
   const allowed = [
     "title",
     "genre",
