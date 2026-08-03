@@ -78,6 +78,10 @@ async function run() {
       { owner_id: 1, viewer_id: 1 },
       { unique: true, name: "owner_viewer_permission_idx" }
     ),
+    db.collection("globalsharesettings").createIndex(
+      { owner_id: 1 },
+      { unique: true, name: "global_share_owner_idx" }
+    ),
     db.collection("blocks").createIndex({ pair_key: 1 }, { unique: true }),
     db.collection("blocks").createIndex({ blocker_id: 1, created_at: -1 }, { name: "blocker_idx" }),
     db.collection("invitecodes").createIndex({ code_hash: 1 }, { unique: true }),

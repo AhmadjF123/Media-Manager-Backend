@@ -119,6 +119,12 @@ const friendPermissionSchema = new mongoose.Schema(
     favorites: { type: Boolean, default: true },
     ratings: { type: Boolean, default: true },
     full_collection: { type: Boolean, default: false },
+    scope: {
+      type: String,
+      enum: ["filters", "all", "selected", "all_except", "none"],
+      default: "filters",
+    },
+    selected_items: { type: [String], default: [] },
   },
   { timestamps: { createdAt: "created_at", updatedAt: "updated_at" }, versionKey: false }
 );
@@ -126,6 +132,25 @@ friendPermissionSchema.index(
   { owner_id: 1, viewer_id: 1 },
   { unique: true, name: "owner_viewer_permission_idx" }
 );
+
+const globalShareSettingSchema = new mongoose.Schema(
+  {
+    owner_id: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    watching: { type: Boolean, default: true },
+    watched: { type: Boolean, default: true },
+    favorites: { type: Boolean, default: true },
+    ratings: { type: Boolean, default: true },
+    full_collection: { type: Boolean, default: false },
+    scope: {
+      type: String,
+      enum: ["filters", "all", "selected", "all_except", "none"],
+      default: "filters",
+    },
+    selected_items: { type: [String], default: [] },
+  },
+  { timestamps: { createdAt: "created_at", updatedAt: "updated_at" }, versionKey: false }
+);
+globalShareSettingSchema.index({ owner_id: 1 }, { unique: true, name: "global_share_owner_idx" });
 
 const blockSchema = new mongoose.Schema(
   {
@@ -156,6 +181,7 @@ const Series = mongoose.model("Series", seriesSchema);
 const Friendship = mongoose.model("Friendship", friendshipSchema);
 const FriendRequest = mongoose.model("FriendRequest", friendRequestSchema);
 const FriendPermission = mongoose.model("FriendPermission", friendPermissionSchema);
+const GlobalShareSetting = mongoose.model("GlobalShareSetting", globalShareSettingSchema);
 const Block = mongoose.model("Block", blockSchema);
 const InviteCode = mongoose.model("InviteCode", inviteCodeSchema);
 
@@ -168,6 +194,8 @@ const DEFAULT_SHARING = Object.freeze({
   favorites: true,
   ratings: true,
   full_collection: false,
+  scope: "filters",
+  selected_items: [],
 });
 
 function normalizeUsername(value) {
@@ -259,13 +287,62 @@ function makeInviteCode() {
 }
 
 function cleanPermissions(input = {}) {
+  const allowedScopes = new Set(["filters", "all", "selected", "all_except", "none"]);
+  let scope = allowedScopes.has(input.scope) ? input.scope : (input.full_collection ? "all" : "filters");
+  const selected_items = Array.from(new Set(
+    (Array.isArray(input.selected_items) ? input.selected_items : [])
+      .map((value) => String(value || "").trim())
+      .filter((value) => /^(movie|series):(?:[a-f0-9]{24}|order:\d+)$/i.test(value))
+  )).slice(0, 5000);
+  const full_collection = scope === "all";
   return {
     watching: Boolean(input.watching),
     watched: Boolean(input.watched),
     favorites: Boolean(input.favorites),
     ratings: Boolean(input.ratings),
-    full_collection: Boolean(input.full_collection),
+    full_collection,
+    scope,
+    selected_items,
   };
+}
+
+async function getGlobalSharing(ownerId) {
+  const doc = await GlobalShareSetting.findOne({ owner_id: ownerId }).lean();
+  return doc ? cleanPermissions(doc) : { ...DEFAULT_SHARING, selected_items: [] };
+}
+
+function parseSelectedItems(values = []) {
+  const parsed = {
+    movieIds: [], seriesIds: [], movieOrders: [], seriesOrders: [], tokenSet: new Set(),
+  };
+  for (const raw of values) {
+    const token = String(raw || "").trim();
+    const match = token.match(/^(movie|series):(.+)$/i);
+    if (!match) continue;
+    const type = match[1].toLowerCase();
+    const value = match[2];
+    parsed.tokenSet.add(`${type}:${value}`);
+    if (/^[a-f0-9]{24}$/i.test(value)) parsed[type === "movie" ? "movieIds" : "seriesIds"].push(value);
+    else if (/^order:\d+$/i.test(value)) parsed[type === "movie" ? "movieOrders" : "seriesOrders"].push(Number(value.slice(6)));
+  }
+  return parsed;
+}
+
+function buildSelectedFilter(userId, type, selected, include) {
+  const ids = selected[type === "movie" ? "movieIds" : "seriesIds"];
+  const orders = selected[type === "movie" ? "movieOrders" : "seriesOrders"];
+  const filter = { user_id: userId };
+  if (include) {
+    const clauses = [];
+    if (ids.length) clauses.push({ _id: { $in: ids } });
+    if (orders.length) clauses.push({ order_number: { $in: orders } });
+    if (!clauses.length) return null;
+    filter.$or = clauses;
+  } else {
+    if (ids.length) filter._id = { $nin: ids };
+    if (orders.length) filter.order_number = { $nin: orders };
+  }
+  return filter;
 }
 
 function relationshipLabel({ friendship, request, currentUserId }) {
@@ -686,15 +763,19 @@ app.post("/api/social/requests/:id/accept", authMiddleware, async (req, res) => 
       },
       { upsert: true, new: true }
     );
+    const [senderDefaults, recipientDefaults] = await Promise.all([
+      getGlobalSharing(request.sender_id),
+      getGlobalSharing(request.recipient_id),
+    ]);
     await Promise.all([
       FriendPermission.findOneAndUpdate(
         { owner_id: request.sender_id, viewer_id: request.recipient_id },
-        { $setOnInsert: DEFAULT_SHARING },
+        { $setOnInsert: senderDefaults },
         { upsert: true }
       ),
       FriendPermission.findOneAndUpdate(
         { owner_id: request.recipient_id, viewer_id: request.sender_id },
-        { $setOnInsert: DEFAULT_SHARING },
+        { $setOnInsert: recipientDefaults },
         { upsert: true }
       ),
       FriendRequest.deleteOne({ _id: request._id }),
@@ -731,9 +812,10 @@ app.get("/api/social/friends", authMiddleware, async (req, res) => {
     const friendIds = friendships.map((item) =>
       item.participants.find((id) => String(id) !== String(req.userId))
     );
-    const [users, permissions] = await Promise.all([
+    const [users, permissions, globalSharing] = await Promise.all([
       User.find({ _id: { $in: friendIds } }).select("username discoverable allow_friend_requests").lean(),
       FriendPermission.find({ owner_id: req.userId, viewer_id: { $in: friendIds } }).lean(),
+      getGlobalSharing(req.userId),
     ]);
     const userMap = new Map(users.map((user) => [String(user._id), user]));
     const permissionMap = new Map(permissions.map((permission) => [String(permission.viewer_id), permission]));
@@ -741,7 +823,7 @@ app.get("/api/social/friends", authMiddleware, async (req, res) => {
       const permission = permissionMap.get(String(id));
       return {
         ...publicUser(userMap.get(String(id))),
-        sharing: permission ? cleanPermissions(permission) : { ...DEFAULT_SHARING },
+        sharing: permission ? cleanPermissions(permission) : globalSharing,
       };
     }).filter((item) => item.id));
   } catch (err) {
@@ -774,7 +856,7 @@ app.get("/api/social/friends/:username/permissions", authMiddleware, async (req,
     if (!viewer) return res.status(404).json({ error: "User not found" });
     if (!(await areFriends(req.userId, viewer._id))) return res.status(403).json({ error: "You are not friends" });
     const permission = await FriendPermission.findOne({ owner_id: req.userId, viewer_id: viewer._id }).lean();
-    res.json({ user: publicUser(viewer), permissions: permission ? cleanPermissions(permission) : { ...DEFAULT_SHARING } });
+    res.json({ user: publicUser(viewer), permissions: permission ? cleanPermissions(permission) : await getGlobalSharing(req.userId) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -792,6 +874,62 @@ app.put("/api/social/friends/:username/permissions", authMiddleware, async (req,
       { upsert: true, new: true, runValidators: true }
     );
     res.json({ success: true, permissions });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/social/sharing/defaults", authMiddleware, async (req, res) => {
+  try {
+    res.json({ permissions: await getGlobalSharing(req.userId) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/social/sharing/defaults", authMiddleware, async (req, res) => {
+  try {
+    const permissions = cleanPermissions(req.body?.permissions || req.body || {});
+    await GlobalShareSetting.findOneAndUpdate(
+      { owner_id: req.userId },
+      { $set: permissions },
+      { upsert: true, new: true, runValidators: true }
+    );
+    let applied = 0;
+    if (req.body?.apply_to_existing === true) {
+      const result = await FriendPermission.updateMany(
+        { owner_id: req.userId },
+        { $set: permissions }
+      );
+      applied = result.modifiedCount || 0;
+    }
+    res.json({ success: true, permissions, applied });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/social/sharing/bulk", authMiddleware, async (req, res) => {
+  try {
+    const usernames = Array.from(new Set(
+      (Array.isArray(req.body?.usernames) ? req.body.usernames : [])
+        .map(normalizeUsername)
+        .filter(Boolean)
+    )).slice(0, 250);
+    if (!usernames.length) return res.status(400).json({ error: "Choose at least one friend" });
+    const users = await User.find({ username_key: { $in: usernames } }).select("_id username username_key").lean();
+    const friendshipKeys = new Set((await Friendship.find({ participants: req.userId }).select("pair_key").lean()).map((x) => x.pair_key));
+    const allowed = users.filter((user) => friendshipKeys.has(socialPairKey(req.userId, user._id)));
+    if (!allowed.length) return res.status(403).json({ error: "No valid friends selected" });
+    const permissions = cleanPermissions(req.body?.permissions || {});
+    await FriendPermission.bulkWrite(allowed.map((viewer) => ({
+      updateOne: {
+        filter: { owner_id: req.userId, viewer_id: viewer._id },
+        update: { $set: permissions },
+        upsert: true,
+      },
+    })));
+    res.json({ success: true, permissions, updated: allowed.map((user) => user.username) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -905,9 +1043,15 @@ app.get("/api/social/friends/:username/vault", authMiddleware, async (req, res) 
     if (!(await areFriends(req.userId, owner._id))) return res.status(403).json({ error: "You are not friends" });
 
     const permissionDoc = await FriendPermission.findOne({ owner_id: owner._id, viewer_id: req.userId }).lean();
-    const permissions = permissionDoc ? cleanPermissions(permissionDoc) : { ...DEFAULT_SHARING };
-    const filter = { user_id: owner._id };
-    if (!permissions.full_collection) {
+    const permissions = permissionDoc ? cleanPermissions(permissionDoc) : await getGlobalSharing(owner._id);
+    const scope = permissions.scope || (permissions.full_collection ? "all" : "filters");
+    if (scope === "none") {
+      return res.json({ owner: publicUser(owner), permissions, items: [], stats: { total: 0, movies: 0, series: 0 } });
+    }
+
+    let movieFilter = { user_id: owner._id };
+    let seriesFilter = { user_id: owner._id };
+    if (scope === "filters") {
       const visibility = [];
       if (permissions.watching) visibility.push({ watch_status: "watching" });
       if (permissions.watched) visibility.push({ watch_status: "watched" });
@@ -915,12 +1059,21 @@ app.get("/api/social/friends/:username/vault", authMiddleware, async (req, res) 
       if (!visibility.length) {
         return res.json({ owner: publicUser(owner), permissions, items: [], stats: { total: 0, movies: 0, series: 0 } });
       }
-      filter.$or = visibility;
+      movieFilter.$or = visibility;
+      seriesFilter.$or = visibility;
+    } else if (scope === "selected" || scope === "all_except") {
+      const selected = parseSelectedItems(permissions.selected_items);
+      const include = scope === "selected";
+      movieFilter = buildSelectedFilter(owner._id, "movie", selected, include);
+      seriesFilter = buildSelectedFilter(owner._id, "series", selected, include);
+      if (include && !movieFilter && !seriesFilter) {
+        return res.json({ owner: publicUser(owner), permissions, items: [], stats: { total: 0, movies: 0, series: 0 } });
+      }
     }
 
     const [movies, series] = await Promise.all([
-      Movie.find(filter).sort({ updated_at: -1, order_number: -1 }).select("-notes -__v").lean(),
-      Series.find(filter).sort({ updated_at: -1, order_number: -1 }).select("-notes -__v").lean(),
+      movieFilter ? Movie.find(movieFilter).sort({ updated_at: -1, order_number: -1 }).select("-notes -__v").lean() : [],
+      seriesFilter ? Series.find(seriesFilter).sort({ updated_at: -1, order_number: -1 }).select("-notes -__v").lean() : [],
     ]);
     const sanitizeShared = (item, media_type) => ({
       ...item,
@@ -1162,6 +1315,7 @@ async function ensureIndexes() {
       Friendship.createIndexes(),
       FriendRequest.createIndexes(),
       FriendPermission.createIndexes(),
+      GlobalShareSetting.createIndexes(),
       Block.createIndexes(),
       InviteCode.createIndexes(),
     ]);

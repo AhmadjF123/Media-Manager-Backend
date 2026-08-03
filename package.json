@@ -1,7 +1,7 @@
 {
   "name": "media-manager",
-  "version": "3.0.0",
-  "description": "Movie & Series Manager with indexed media, unique handles, friends, invites and private sharing",
+  "version": "3.1.0",
+  "description": "Movie & Series Manager with indexed media, unique handles, friends and precise per-title sharing",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
