@@ -16,6 +16,7 @@ const MEDIA_INDEXES = [
   [{ user_id: 1, genre: 1 }, { name: "user_genre_idx" }],
   [{ user_id: 1, watch_status: 1, updated_at: -1 }, { name: "user_watch_status_idx" }],
   [{ user_id: 1, favorite: 1, updated_at: -1 }, { name: "user_favorite_idx" }],
+  [{ user_id: 1, tmdb_id: 1 }, { name: "user_tmdb_idx" }],
 ];
 
 async function createMediaIndexes(collection) {
@@ -89,7 +90,7 @@ async function run() {
     db.collection("invitecodes").createIndex({ owner_id: 1, created_at: -1 }, { name: "invite_owner_idx" }),
   ]);
 
-  console.log("✅ All Media Manager and social indexes are ready");
+  console.log("✅ All Media Manager, social and recommendation indexes are ready");
   await mongoose.connection.close();
 }
 

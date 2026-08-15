@@ -13,6 +13,12 @@ const MONGODB_URI =
   process.env.MONGODB_URI ||
   "mongodb+srv://admin:admin123@cluster0.1x1ifj7.mongodb.net/media_manager?retryWrites=true&w=majority";
 
+const TMDB_API_KEY =
+  process.env.TMDB_API_KEY ||
+  "001a45ee2ffa1d6f2f16fc4c16ae276a";
+const TMDB_BASE_URL = "https://api.themoviedb.org/3";
+const TMDB_IMAGE_W500 = "https://image.tmdb.org/t/p/w500";
+
 mongoose.set("strictQuery", true);
 mongoose.set("bufferCommands", false);
 
@@ -43,6 +49,7 @@ const commonMediaFields = {
   release_year: { type: Number, required: true },
   rating: { type: Number, default: 0 },
   poster_url: { type: String, default: null },
+  tmdb_id: { type: Number, min: 1, default: null },
   order_number: { type: Number, required: true, default: 0 },
   notes: { type: String, default: null },
   watch_status: {
@@ -79,6 +86,7 @@ function createMediaSchema(extraFields = {}) {
   schema.index({ user_id: 1, genre: 1 }, { name: "user_genre_idx" });
   schema.index({ user_id: 1, watch_status: 1, updated_at: -1 }, { name: "user_watch_status_idx" });
   schema.index({ user_id: 1, favorite: 1, updated_at: -1 }, { name: "user_favorite_idx" });
+  schema.index({ user_id: 1, tmdb_id: 1 }, { name: "user_tmdb_idx" });
 
   return schema;
 }
@@ -87,6 +95,7 @@ const movieSchema = createMediaSchema();
 const seriesSchema = createMediaSchema({
   end_year: { type: Number, default: null },
   number_of_seasons: { type: Number, min: 1, default: null },
+  watched_seasons: { type: Number, min: 0, default: null },
 });
 
 const friendshipSchema = new mongoose.Schema(
@@ -482,7 +491,609 @@ const cacheCleanupTimer = setInterval(() => {
     if (entry.expiresAt <= now) mediaResponseCache.delete(key);
   }
 }, Math.max(MEDIA_CACHE_TTL_MS, 30_000));
+
 cacheCleanupTimer.unref();
+
+// ==================== Personalized recommendation engine ====================
+// The engine runs on the backend so the website and any future mobile client can
+// share the same ranking logic. TMDB responses are cached aggressively to keep
+// refreshes fast and to avoid unnecessary third-party requests.
+
+const RECOMMENDATION_CACHE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.RECOMMENDATION_CACHE_TTL_MS) || 20 * 60_000
+);
+const TMDB_CACHE_TTL_MS = Math.max(
+  5 * 60_000,
+  Number(process.env.TMDB_CACHE_TTL_MS) || 6 * 60 * 60_000
+);
+const recommendationCache = new Map();
+const tmdbResponseCache = new Map();
+let genreNameMapsPromise = null;
+
+function recommendationCacheKey(userId) {
+  return String(userId);
+}
+
+function invalidateUserRecommendationCache(userId) {
+  recommendationCache.delete(recommendationCacheKey(userId));
+}
+
+function getCachedRecommendation(userId) {
+  const key = recommendationCacheKey(userId);
+  const entry = recommendationCache.get(key);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    recommendationCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCachedRecommendation(userId, value) {
+  recommendationCache.set(recommendationCacheKey(userId), {
+    value,
+    expiresAt: Date.now() + RECOMMENDATION_CACHE_TTL_MS,
+  });
+  while (recommendationCache.size > 500) {
+    recommendationCache.delete(recommendationCache.keys().next().value);
+  }
+}
+
+function cleanTitleKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function yearFromDate(value) {
+  const match = String(value || "").match(/^(\d{4})/);
+  return match ? Number(match[1]) : 0;
+}
+
+function isReleasedByToday(dateValue) {
+  if (!dateValue) return true;
+  const parsed = new Date(`${String(dateValue).slice(0, 10)}T00:00:00Z`).getTime();
+  return !Number.isFinite(parsed) || parsed <= Date.now();
+}
+
+function itemCountsAsWatched(item) {
+  if (item.watch_status === "watched") return true;
+  if (["watching", "plan_to_watch", "dropped"].includes(item.watch_status)) return false;
+  // Legacy collections existed before watch-status tracking. Those saved titles
+  // represented watched media, so preserving that assumption keeps old accounts useful.
+  return true;
+}
+
+function itemCountsAsUnwatched(item) {
+  return ["watching", "plan_to_watch"].includes(item.watch_status);
+}
+
+function getSourceStrength(item) {
+  let score = 16;
+  if (item.favorite) score += 10;
+  const rating = Number(item.rating) || 0;
+  score += Math.max(0, rating - 5) * 2.4;
+  if (item.watch_status === "watched") score += 4;
+  if (item.rewatch_count > 0) score += Math.min(8, Number(item.rewatch_count) * 2);
+
+  const activityDate = item.watch_date || item.updated_at || item.created_at;
+  const activityTime = activityDate ? new Date(activityDate).getTime() : 0;
+  if (Number.isFinite(activityTime) && activityTime > 0) {
+    const ageDays = Math.max(0, (Date.now() - activityTime) / 86_400_000);
+    if (ageDays <= 30) score += 8;
+    else if (ageDays <= 90) score += 5;
+    else if (ageDays <= 180) score += 2;
+  }
+  return score;
+}
+
+async function tmdbGet(path, params = {}, { ttl = TMDB_CACHE_TTL_MS } = {}) {
+  if (!TMDB_API_KEY) throw new Error("TMDB_API_KEY is not configured");
+  const url = new URL(`${TMDB_BASE_URL}${path}`);
+  url.searchParams.set("api_key", TMDB_API_KEY);
+  url.searchParams.set("language", "en-US");
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const cacheKey = url.toString();
+  const cached = tmdbResponseCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) tmdbResponseCache.delete(cacheKey);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7_000);
+  timeout.unref?.();
+  try {
+    const response = await fetch(url, {
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const error = new Error(`TMDB request failed (${response.status})`);
+      error.status = response.status;
+      throw error;
+    }
+    const value = await response.json();
+    tmdbResponseCache.set(cacheKey, { value, expiresAt: Date.now() + ttl });
+    if (tmdbResponseCache.size > 1_500) {
+      tmdbResponseCache.delete(tmdbResponseCache.keys().next().value);
+    }
+    return value;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try {
+        results[index] = await mapper(items[index], index);
+      } catch (error) {
+        results[index] = { __error: error };
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, limit), items.length || 1) }, () => worker())
+  );
+  return results;
+}
+
+async function getGenreNameMaps() {
+  if (!genreNameMapsPromise) {
+    genreNameMapsPromise = Promise.all([
+      tmdbGet("/genre/movie/list", {}, { ttl: 24 * 60 * 60_000 }),
+      tmdbGet("/genre/tv/list", {}, { ttl: 24 * 60 * 60_000 }),
+    ]).then(([movieData, tvData]) => ({
+      movie: new Map((movieData.genres || []).map((genre) => [Number(genre.id), genre.name])),
+      series: new Map((tvData.genres || []).map((genre) => [Number(genre.id), genre.name])),
+    })).catch((error) => {
+      genreNameMapsPromise = null;
+      throw error;
+    });
+  }
+  return genreNameMapsPromise;
+}
+
+function chooseTmdbSearchResult(results, item, type) {
+  const titleKey = cleanTitleKey(item.title);
+  const targetYear = Number(item.release_year) || 0;
+  let best = null;
+  let bestScore = -Infinity;
+  for (const result of (results || []).slice(0, 12)) {
+    const candidateTitle = type === "movie"
+      ? (result.title || result.original_title)
+      : (result.name || result.original_name);
+    const candidateYear = yearFromDate(
+      type === "movie" ? result.release_date : result.first_air_date
+    );
+    let score = 0;
+    if (cleanTitleKey(candidateTitle) === titleKey) score += 80;
+    else if (cleanTitleKey(candidateTitle).includes(titleKey) || titleKey.includes(cleanTitleKey(candidateTitle))) {
+      score += 35;
+    }
+    if (targetYear && candidateYear) {
+      const diff = Math.abs(targetYear - candidateYear);
+      score += diff === 0 ? 30 : diff === 1 ? 14 : Math.max(0, 8 - diff * 2);
+    }
+    score += Math.min(12, Number(result.popularity) / 10 || 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = result;
+    }
+  }
+  return best;
+}
+
+async function resolveMediaTmdb(item, type) {
+  const existingId = Number(item.tmdb_id);
+  if (Number.isInteger(existingId) && existingId > 0) return existingId;
+
+  const endpoint = type === "movie" ? "/search/movie" : "/search/tv";
+  const params = { query: item.title, include_adult: "false" };
+  if (item.release_year) {
+    params[type === "movie" ? "primary_release_year" : "first_air_date_year"] = item.release_year;
+  }
+
+  let data = await tmdbGet(endpoint, params);
+  let match = chooseTmdbSearchResult(data.results, item, type);
+  if (!match && item.release_year) {
+    data = await tmdbGet(endpoint, { query: item.title, include_adult: "false" });
+    match = chooseTmdbSearchResult(data.results, item, type);
+  }
+  const id = Number(match?.id) || 0;
+  if (id > 0 && item._id) {
+    const Model = type === "movie" ? Movie : Series;
+    Model.updateOne(
+      { _id: item._id, user_id: item.user_id },
+      { $set: { tmdb_id: id } }
+    ).catch(() => {});
+    item.tmdb_id = id;
+  }
+  return id;
+}
+
+function getAiredSeasons(details) {
+  const today = new Date().toISOString().slice(0, 10);
+  return (details?.seasons || [])
+    .filter((season) =>
+      Number(season.season_number) > 0 &&
+      Number(season.episode_count) > 0 &&
+      Boolean(season.air_date) &&
+      String(season.air_date) <= today
+    )
+    .sort((a, b) => Number(a.season_number) - Number(b.season_number));
+}
+
+function recommendationPoster(path) {
+  return path ? `${TMDB_IMAGE_W500}${path}` : null;
+}
+
+function candidateFromTmdb(raw, mediaType) {
+  const date = mediaType === "movie" ? raw.release_date : raw.first_air_date;
+  return {
+    tmdb_id: Number(raw.id) || null,
+    media_type: mediaType,
+    title: mediaType === "movie"
+      ? (raw.title || raw.original_title || "Untitled")
+      : (raw.name || raw.original_name || "Untitled"),
+    release_date: date || null,
+    release_year: yearFromDate(date),
+    poster_url: recommendationPoster(raw.poster_path),
+    backdrop_url: raw.backdrop_path
+      ? `https://image.tmdb.org/t/p/w780${raw.backdrop_path}`
+      : null,
+    tmdb_rating: Number(raw.vote_average) || 0,
+    popularity: Number(raw.popularity) || 0,
+    overview: String(raw.overview || "").trim(),
+    genre_ids: Array.isArray(raw.genre_ids)
+      ? raw.genre_ids.map(Number).filter(Number.isFinite)
+      : (Array.isArray(raw.genres) ? raw.genres.map((genre) => Number(genre.id)).filter(Number.isFinite) : []),
+  };
+}
+
+function addCandidate(candidateMap, raw, mediaType, {
+  score = 0,
+  reason = "",
+  reasonType = "related",
+  sourceTitle = "",
+  progress = null,
+} = {}) {
+  if (!raw?.id || raw.adult === true) return;
+  const base = candidateFromTmdb(raw, mediaType);
+  if (!isReleasedByToday(base.release_date) && reasonType !== "upcoming") return;
+  const key = `${mediaType}:${base.tmdb_id}`;
+  const current = candidateMap.get(key) || {
+    ...base,
+    score: 0,
+    reasons: [],
+    reason_types: [],
+    source_titles: [],
+    progress: null,
+  };
+
+  current.score += Number(score) || 0;
+  if (reason && !current.reasons.includes(reason)) current.reasons.push(reason);
+  if (reasonType && !current.reason_types.includes(reasonType)) current.reason_types.push(reasonType);
+  if (sourceTitle && !current.source_titles.includes(sourceTitle)) current.source_titles.push(sourceTitle);
+  if (progress) current.progress = progress;
+
+  // Keep the best available metadata if a duplicate came from another source.
+  if (!current.poster_url && base.poster_url) current.poster_url = base.poster_url;
+  if (!current.backdrop_url && base.backdrop_url) current.backdrop_url = base.backdrop_url;
+  if (!current.overview && base.overview) current.overview = base.overview;
+  current.tmdb_rating = Math.max(current.tmdb_rating || 0, base.tmdb_rating || 0);
+  current.popularity = Math.max(current.popularity || 0, base.popularity || 0);
+
+  candidateMap.set(key, current);
+}
+
+async function fetchTvRecommendations(tvId) {
+  try {
+    return await tmdbGet(`/tv/${tvId}/recommendations`, { page: 1 });
+  } catch (error) {
+    // Older/future TMDB deployments can still provide "similar"; keep the engine useful.
+    return tmdbGet(`/tv/${tvId}/similar`, { page: 1 });
+  }
+}
+
+function makeVaultLookup(movies, series) {
+  const byTmdb = new Map();
+  const byTitleYear = new Map();
+  for (const [type, items] of [["movie", movies], ["series", series]]) {
+    for (const item of items) {
+      if (Number(item.tmdb_id) > 0) byTmdb.set(`${type}:${Number(item.tmdb_id)}`, item);
+      byTitleYear.set(
+        `${type}:${cleanTitleKey(item.title)}:${Number(item.release_year) || 0}`,
+        item
+      );
+    }
+  }
+  return {
+    find(candidate) {
+      return byTmdb.get(`${candidate.media_type}:${candidate.tmdb_id}`) ||
+        byTitleYear.get(
+          `${candidate.media_type}:${cleanTitleKey(candidate.title)}:${Number(candidate.release_year) || 0}`
+        ) ||
+        null;
+    },
+  };
+}
+
+function sortRecommendationItems(items) {
+  return items.sort((a, b) => {
+    const scoreDiff = (Number(b.score) || 0) - (Number(a.score) || 0);
+    if (scoreDiff) return scoreDiff;
+    const dateDiff = String(b.release_date || "").localeCompare(String(a.release_date || ""));
+    if (dateDiff) return dateDiff;
+    return (Number(b.tmdb_rating) || 0) - (Number(a.tmdb_rating) || 0);
+  });
+}
+
+function trimRecommendation(item) {
+  const score = Math.max(1, Number(item.score) || 1);
+  return {
+    ...item,
+    score: Math.round(score),
+    match_score: Math.min(99, Math.max(55, Math.round(55 + Math.min(44, score / 4)))),
+    reasons: item.reasons.slice(0, 3),
+    source_titles: item.source_titles.slice(0, 4),
+  };
+}
+
+async function buildRecommendationPayload(userId) {
+  const [movies, series, genreMaps] = await Promise.all([
+    Movie.find({ user_id: userId })
+      .select("_id user_id title release_year rating tmdb_id watch_status watch_date favorite rewatch_count order_number created_at updated_at")
+      .lean(),
+    Series.find({ user_id: userId })
+      .select("_id user_id title release_year rating tmdb_id watch_status watch_date favorite rewatch_count order_number number_of_seasons watched_seasons created_at updated_at")
+      .lean(),
+    getGenreNameMaps().catch(() => ({ movie: new Map(), series: new Map() })),
+  ]);
+
+  const allItems = [
+    ...movies.map((item) => ({ ...item, media_type: "movie" })),
+    ...series.map((item) => ({ ...item, media_type: "series" })),
+  ];
+  const watchedItems = allItems
+    .filter(itemCountsAsWatched)
+    .sort((a, b) => getSourceStrength(b) - getSourceStrength(a));
+
+  const candidateMap = new Map();
+
+  // Series progress is checked across the whole watched/watching series history, not
+  // only the handful of titles used as taste anchors. This is what lets the engine
+  // notice a newly aired season even for an older show.
+  const progressSeries = allItems.filter((item) =>
+    item.media_type === "series" &&
+    (itemCountsAsWatched(item) || item.watch_status === "watching")
+  );
+  await mapWithConcurrency(progressSeries, 5, async (item) => {
+    item.tmdb_id = await resolveMediaTmdb(item, "series");
+    return item;
+  });
+  await mapWithConcurrency(progressSeries.filter((item) => Number(item.tmdb_id) > 0), 5, async (item) => {
+    const details = await tmdbGet(`/tv/${Number(item.tmdb_id)}`);
+    const airedSeasons = getAiredSeasons(details);
+    const totalAired = airedSeasons.length;
+    const hasManualProgress =
+      item.watched_seasons !== null &&
+      item.watched_seasons !== undefined &&
+      item.watched_seasons !== "";
+    const manuallyTracked = hasManualProgress ? Number(item.watched_seasons) : null;
+    let watchedThrough = Number.isFinite(manuallyTracked) && manuallyTracked >= 0
+      ? manuallyTracked
+      : null;
+    if (watchedThrough === null) {
+      watchedThrough = itemCountsAsWatched(item)
+        ? Math.max(0, Number(item.number_of_seasons) || 0)
+        : 0;
+    }
+    if (totalAired <= watchedThrough) return;
+
+    const nextSeasonNumber = airedSeasons
+      .map((season) => Number(season.season_number))
+      .find((seasonNumber) => seasonNumber > watchedThrough) || watchedThrough + 1;
+    addCandidate(candidateMap, details, "series", {
+      score: 190 + getSourceStrength(item) + Math.min(20, (totalAired - watchedThrough) * 4),
+      reason: totalAired - watchedThrough === 1
+        ? `Season ${nextSeasonNumber} is ready for you`
+        : `${totalAired - watchedThrough} newer seasons are available`,
+      reasonType: "new_season",
+      sourceTitle: item.title,
+      progress: {
+        watched_seasons: watchedThrough,
+        aired_seasons: totalAired,
+        next_season: nextSeasonNumber,
+        latest_aired_season: Number(airedSeasons.at(-1)?.season_number) || totalAired,
+      },
+    });
+  });
+
+  // A smaller set of strong taste anchors keeps recommendation calls fast while the
+  // dedicated progress pass above still covers every tracked series.
+  const sourceItems = watchedItems.slice(0, 12);
+  await mapWithConcurrency(sourceItems, 4, async (item) => {
+    item.tmdb_id = await resolveMediaTmdb(item, item.media_type);
+    return item;
+  });
+
+  await mapWithConcurrency(sourceItems, 4, async (item) => {
+    const tmdbId = Number(item.tmdb_id);
+    if (!tmdbId) return;
+    const type = item.media_type;
+    const sourceStrength = getSourceStrength(item);
+
+    if (type === "movie") {
+      const [detailsResult, recommendationsResult] = await Promise.allSettled([
+        tmdbGet(`/movie/${tmdbId}`),
+        tmdbGet(`/movie/${tmdbId}/recommendations`, { page: 1 }),
+      ]);
+      const details = detailsResult.status === "fulfilled" ? detailsResult.value : null;
+      const recommendations = recommendationsResult.status === "fulfilled"
+        ? recommendationsResult.value.results || []
+        : [];
+
+      for (const rec of recommendations.slice(0, 12)) {
+        addCandidate(candidateMap, rec, "movie", {
+          score: sourceStrength + 18 + Math.min(10, Number(rec.vote_average) || 0),
+          reason: `Because you watched ${item.title}`,
+          reasonType: "because_watched",
+          sourceTitle: item.title,
+        });
+      }
+
+      const collectionId = Number(details?.belongs_to_collection?.id);
+      if (collectionId) {
+        try {
+          const collection = await tmdbGet(`/collection/${collectionId}`);
+          const releasedParts = (collection.parts || [])
+            .filter((part) => isReleasedByToday(part.release_date))
+            .sort((a, b) => String(a.release_date || "").localeCompare(String(b.release_date || "")));
+          const sourceIndex = releasedParts.findIndex((part) => Number(part.id) === tmdbId);
+          const following = releasedParts.filter((part, index) =>
+            Number(part.id) !== tmdbId && (sourceIndex < 0 || index > sourceIndex)
+          );
+          for (const [offset, part] of following.slice(0, 4).entries()) {
+            addCandidate(candidateMap, part, "movie", {
+              score: 145 - offset * 12 + sourceStrength,
+              reason: `Next in ${collection.name || "this film series"}`,
+              reasonType: "franchise_next",
+              sourceTitle: item.title,
+            });
+          }
+        } catch {
+          // Recommendation results below still provide useful suggestions.
+        }
+      }
+      return;
+    }
+
+    const recommendationsResult = await Promise.allSettled([
+      fetchTvRecommendations(tmdbId),
+    ]);
+    const recommendations = recommendationsResult[0]?.status === "fulfilled"
+      ? recommendationsResult[0].value.results || []
+      : [];
+
+    for (const rec of recommendations.slice(0, 12)) {
+      addCandidate(candidateMap, rec, "series", {
+        score: sourceStrength + 20 + Math.min(10, Number(rec.vote_average) || 0),
+        reason: `Because you watched ${item.title}`,
+        reasonType: "because_watched",
+        sourceTitle: item.title,
+      });
+    }
+
+  });
+
+  const vaultLookup = makeVaultLookup(movies, series);
+  const now = Date.now();
+  const recentCutoff = new Date(now);
+  recentCutoff.setMonth(recentCutoff.getMonth() - 24);
+
+  const allCandidates = [];
+  for (const candidate of candidateMap.values()) {
+    const vaultItem = vaultLookup.find(candidate);
+    const isNewSeasonSelf = candidate.reason_types.includes("new_season");
+    const vaultWatched = vaultItem ? itemCountsAsWatched(vaultItem) : false;
+    if (vaultItem?.watch_status === "dropped") continue;
+    if (vaultItem && vaultWatched && !isNewSeasonSelf) continue;
+
+    if (vaultItem) {
+      candidate.in_vault = true;
+      candidate.vault_order_number = Number(vaultItem.order_number) || null;
+      candidate.vault_watch_status = vaultItem.watch_status || null;
+      candidate.vault_rating = Number(vaultItem.rating) || 0;
+      candidate.score += itemCountsAsUnwatched(vaultItem) ? 42 : 22;
+      if (!candidate.poster_url && vaultItem.poster_url) candidate.poster_url = vaultItem.poster_url;
+    } else {
+      candidate.in_vault = false;
+      candidate.vault_order_number = null;
+      candidate.vault_watch_status = null;
+      candidate.vault_rating = null;
+    }
+
+    const genreMap = genreMaps[candidate.media_type] || new Map();
+    candidate.genres = candidate.genre_ids
+      .map((id) => genreMap.get(Number(id)))
+      .filter(Boolean)
+      .slice(0, 4);
+
+    const releaseTime = candidate.release_date
+      ? new Date(`${candidate.release_date}T00:00:00Z`).getTime()
+      : 0;
+    candidate.is_recent_release = Boolean(
+      releaseTime && releaseTime >= recentCutoff.getTime() && releaseTime <= now
+    );
+
+    candidate.primary_reason = candidate.reasons[0] || "Picked from your watch history";
+    candidate.primary_reason_type = candidate.reason_types[0] || "related";
+    allCandidates.push(trimRecommendation(candidate));
+  }
+
+  const claimed = new Set();
+  const take = (predicate, limit, sortFn = sortRecommendationItems) => {
+    const selected = allCandidates
+      .filter((item) => !claimed.has(`${item.media_type}:${item.tmdb_id}`) && predicate(item));
+    sortFn(selected);
+    const sliced = selected.slice(0, limit);
+    for (const item of sliced) claimed.add(`${item.media_type}:${item.tmdb_id}`);
+    return sliced;
+  };
+
+  const continueStory = take(
+    (item) => item.reason_types.includes("new_season") || item.reason_types.includes("franchise_next"),
+    14
+  );
+  const fromVault = take((item) => item.in_vault, 14);
+  const newReleases = take(
+    (item) => !item.in_vault && item.is_recent_release,
+    14,
+    (items) => items.sort((a, b) => {
+      const yearDiff = (Number(b.release_year) || 0) - (Number(a.release_year) || 0);
+      if (yearDiff) return yearDiff;
+      const dateDiff = String(b.release_date || "").localeCompare(String(a.release_date || ""));
+      return dateDiff || (Number(b.score) || 0) - (Number(a.score) || 0);
+    })
+  );
+  const becauseYouWatched = take((item) => !item.in_vault, 18);
+
+  return {
+    generated_at: new Date().toISOString(),
+    profile: {
+      vault_total: allItems.length,
+      watched_count: watchedItems.length,
+      movies_watched: watchedItems.filter((item) => item.media_type === "movie").length,
+      series_watched: watchedItems.filter((item) => item.media_type === "series").length,
+      tracked_series_progress: progressSeries.length,
+    },
+    sections: {
+      continue_story: continueStory,
+      from_vault: fromVault,
+      new_releases: newReleases,
+      because_you_watched: becauseYouWatched,
+    },
+    meta: {
+      recommendation_version: 1,
+      cached_for_ms: RECOMMENDATION_CACHE_TTL_MS,
+      source_titles_used: sourceItems.length,
+    },
+  };
+}
 
 // ==================== Middleware ====================
 
@@ -524,6 +1135,8 @@ app.get("/api/health", (_req, res) => {
     status: mongoose.connection.readyState === 1 ? "ok" : "starting",
     database: mongoose.connection.readyState === 1 ? "connected" : "connecting",
     cache_entries: mediaResponseCache.size,
+    recommendation_cache_entries: recommendationCache.size,
+    tmdb_cache_entries: tmdbResponseCache.size,
   });
 });
 
@@ -1102,6 +1715,32 @@ app.get("/api/social/friends/:username/vault", authMiddleware, async (req, res) 
   }
 });
 
+// ==================== Recommendations ====================
+
+app.get("/api/recommendations", authMiddleware, async (req, res) => {
+  const forceRefresh = String(req.query.refresh || "") === "1";
+  if (!forceRefresh) {
+    const cached = getCachedRecommendation(req.userId);
+    if (cached) {
+      res.set("X-Recommendation-Cache", "HIT");
+      return res.json(cached);
+    }
+  }
+
+  try {
+    const payload = await buildRecommendationPayload(req.userId);
+    setCachedRecommendation(req.userId, payload);
+    res.set("X-Recommendation-Cache", "MISS");
+    res.json(payload);
+  } catch (error) {
+    console.error("Recommendation engine error:", error);
+    res.status(502).json({
+      error: "Could not build recommendations right now",
+      detail: process.env.NODE_ENV === "production" ? undefined : error.message,
+    });
+  }
+});
+
 // ==================== Media routes ====================
 
 app.get("/api/media/all", authMiddleware, async (req, res) => {
@@ -1184,13 +1823,14 @@ function sanitizeMediaData(data = {}, type) {
     "release_year",
     "rating",
     "poster_url",
+    "tmdb_id",
     "notes",
     "watch_status",
     "watch_date",
     "favorite",
     "rewatch_count",
   ];
-  if (type === "series") allowed.push("end_year", "number_of_seasons");
+  if (type === "series") allowed.push("end_year", "number_of_seasons", "watched_seasons");
   return Object.fromEntries(allowed.filter((key) => Object.hasOwn(data, key)).map((key) => [key, data[key]]));
 }
 
@@ -1212,6 +1852,7 @@ app.post("/api/media", authMiddleware, async (req, res) => {
     });
 
     invalidateUserMediaCache(req.userId);
+    invalidateUserRecommendationCache(req.userId);
     res.status(201).json({
       success: true,
       order_number: newOrder,
@@ -1246,6 +1887,7 @@ app.put("/api/media", authMiddleware, async (req, res) => {
     }
 
     invalidateUserMediaCache(req.userId);
+    invalidateUserRecommendationCache(req.userId);
     res.json({ success: true, item: { ...updated, media_type: type } });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1264,6 +1906,7 @@ app.delete("/api/media", authMiddleware, async (req, res) => {
     // Keep order numbers stable. Avoiding a full collection re-number makes deletes instant
     // and prevents concurrent edits from targeting a different item after a deletion.
     invalidateUserMediaCache(req.userId);
+    invalidateUserRecommendationCache(req.userId);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
