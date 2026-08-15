@@ -573,6 +573,35 @@ function itemCountsAsUnwatched(item) {
   return ["watching", "plan_to_watch"].includes(item.watch_status);
 }
 
+function effectiveWatchedSeasons(item) {
+  const savedSeasons = Math.max(0, Number(item?.number_of_seasons) || 0);
+  const hasTrackedValue =
+    item?.watched_seasons !== null &&
+    item?.watched_seasons !== undefined &&
+    item?.watched_seasons !== "" &&
+    Number.isFinite(Number(item.watched_seasons));
+  const tracked = hasTrackedValue ? Math.max(0, Number(item.watched_seasons)) : null;
+
+  // `watched` means the user finished every season that was saved in the vault at
+  // that moment. Older accounts had no progress field at all, and a few early
+  // clients wrote 0 while still treating the title as fully watched. In both cases
+  // the saved season count is the safest completion baseline.
+  if (item?.watch_status === "watched") {
+    return Math.max(savedSeasons, tracked ?? 0);
+  }
+
+  // Legacy titles predate watch-status tracking and historically represented
+  // already-watched media. Only a positive explicit progress value should override
+  // that legacy baseline. This prevents finished shows from being presented as 0/N.
+  if (!item?.watch_status) {
+    if (tracked !== null && tracked > 0) return tracked;
+    return savedSeasons;
+  }
+
+  // Watching / plan-to-watch / dropped titles use the explicit progress value.
+  return tracked ?? 0;
+}
+
 function getSourceStrength(item) {
   let score = 16;
   if (item.favorite) score += 10;
@@ -844,10 +873,13 @@ function sortRecommendationItems(items) {
 
 function trimRecommendation(item) {
   const score = Math.max(1, Number(item.score) || 1);
+  // A recommendation score is a ranking signal, not a probability. Keep the
+  // display value useful instead of saturating nearly every strong pick at 99%.
+  const displayMatch = Math.round(60 + 36 * (1 - Math.exp(-score / 105)));
   return {
     ...item,
     score: Math.round(score),
-    match_score: Math.min(99, Math.max(55, Math.round(55 + Math.min(44, score / 4)))),
+    match_score: Math.min(96, Math.max(60, displayMatch)),
     reasons: item.reasons.slice(0, 3),
     source_titles: item.source_titles.slice(0, 4),
   };
@@ -889,19 +921,32 @@ async function buildRecommendationPayload(userId) {
     const details = await tmdbGet(`/tv/${Number(item.tmdb_id)}`);
     const airedSeasons = getAiredSeasons(details);
     const totalAired = airedSeasons.length;
-    const hasManualProgress =
+    let watchedThrough = effectiveWatchedSeasons(item);
+
+    // Some long-standing collections predate both season-count and progress fields.
+    // Those entries already mean "I watched this title". On the first smart scan,
+    // establish today's aired-season count as their baseline instead of telling the
+    // user to start a finished show from Season 1. Persisting that baseline is what
+    // lets a genuinely NEW season be detected later.
+    const hasSavedSeasonBaseline = Math.max(0, Number(item.number_of_seasons) || 0) > 0;
+    const hasTrackedSeasonBaseline =
       item.watched_seasons !== null &&
       item.watched_seasons !== undefined &&
-      item.watched_seasons !== "";
-    const manuallyTracked = hasManualProgress ? Number(item.watched_seasons) : null;
-    let watchedThrough = Number.isFinite(manuallyTracked) && manuallyTracked >= 0
-      ? manuallyTracked
-      : null;
-    if (watchedThrough === null) {
-      watchedThrough = itemCountsAsWatched(item)
-        ? Math.max(0, Number(item.number_of_seasons) || 0)
-        : 0;
+      item.watched_seasons !== "" &&
+      Math.max(0, Number(item.watched_seasons) || 0) > 0;
+    if (
+      totalAired > 0 &&
+      itemCountsAsWatched(item) &&
+      !hasSavedSeasonBaseline &&
+      !hasTrackedSeasonBaseline
+    ) {
+      watchedThrough = totalAired;
+      Series.updateOne(
+        { _id: item._id, user_id: item.user_id },
+        { $set: { watched_seasons: totalAired } }
+      ).catch(() => {});
     }
+
     if (totalAired <= watchedThrough) return;
 
     const nextSeasonNumber = airedSeasons
