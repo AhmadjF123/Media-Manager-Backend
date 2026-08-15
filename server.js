@@ -50,6 +50,13 @@ const commonMediaFields = {
   rating: { type: Number, default: 0 },
   poster_url: { type: String, default: null },
   tmdb_id: { type: Number, min: 1, default: null },
+  tmdb_relation_keywords: {
+    type: [{ _id: false, id: { type: Number }, name: { type: String, trim: true } }],
+    default: [],
+  },
+  tmdb_collection_id: { type: Number, default: null },
+  tmdb_collection_name: { type: String, default: null },
+  tmdb_relation_scanned_at: { type: Date, default: null },
   order_number: { type: Number, required: true, default: 0 },
   notes: { type: String, default: null },
   watch_status: {
@@ -512,7 +519,7 @@ const tmdbResponseCache = new Map();
 let genreNameMapsPromise = null;
 
 function recommendationCacheKey(userId) {
-  return String(userId);
+  return `v3:${String(userId)}`;
 }
 
 function invalidateUserRecommendationCache(userId) {
@@ -754,6 +761,244 @@ async function resolveMediaTmdb(item, type) {
   return id;
 }
 
+
+const RELATION_SCAN_MAX_AGE_MS = Math.max(
+  24 * 60 * 60_000,
+  Number(process.env.RELATION_SCAN_MAX_AGE_MS) || 30 * 24 * 60 * 60_000
+);
+const RELATION_SYNC_SCAN_LIMIT = Math.max(
+  24,
+  Math.min(160, Number(process.env.RELATION_SYNC_SCAN_LIMIT) || 96)
+);
+const relationshipEnrichmentJobs = new Set();
+
+function relationMetadataIsFresh(item) {
+  if (!item?.tmdb_relation_scanned_at) return false;
+  const scannedAt = new Date(item.tmdb_relation_scanned_at).getTime();
+  return Number.isFinite(scannedAt) && (Date.now() - scannedAt) < RELATION_SCAN_MAX_AGE_MS;
+}
+
+function relationKeywordList(details) {
+  const raw = details?.keywords?.keywords || details?.keywords?.results || [];
+  return raw
+    .map((keyword) => ({ id: Number(keyword?.id) || 0, name: String(keyword?.name || "").trim() }))
+    .filter((keyword) => keyword.id > 0 && keyword.name)
+    .slice(0, 60);
+}
+
+function relationScanPriority(item) {
+  let score = getSourceStrength(item);
+  if (Number(item?.tmdb_id) > 0) score += 40;
+  const genre = String(item?.genre || "").toLowerCase();
+  if (/action|adventure|science fiction|sci-fi|fantasy|superhero|animation/.test(genre)) score += 22;
+  if (item?.favorite) score += 12;
+  return score;
+}
+
+async function enrichRelationMetadata(item, { force = false } = {}) {
+  if (!item || (!force && relationMetadataIsFresh(item))) return item;
+  const mediaType = item.media_type === "series" ? "series" : "movie";
+  const tmdbType = mediaType === "series" ? "tv" : "movie";
+  const Model = mediaType === "series" ? Series : Movie;
+  const tmdbId = await resolveMediaTmdb(item, mediaType);
+  if (!tmdbId) return item;
+
+  const details = await tmdbGet(`/${tmdbType}/${tmdbId}`, { append_to_response: "keywords" });
+  const keywords = relationKeywordList(details);
+  const collectionId = mediaType === "movie" ? Number(details?.belongs_to_collection?.id) || null : null;
+  const collectionName = mediaType === "movie"
+    ? String(details?.belongs_to_collection?.name || "").trim() || null
+    : null;
+  const scannedAt = new Date();
+
+  item.tmdb_id = tmdbId;
+  item.tmdb_relation_keywords = keywords;
+  item.tmdb_collection_id = collectionId;
+  item.tmdb_collection_name = collectionName;
+  item.tmdb_relation_scanned_at = scannedAt;
+
+  if (item._id) {
+    await Model.updateOne(
+      { _id: item._id, user_id: item.user_id },
+      {
+        $set: {
+          tmdb_id: tmdbId,
+          tmdb_relation_keywords: keywords,
+          tmdb_collection_id: collectionId,
+          tmdb_collection_name: collectionName,
+          tmdb_relation_scanned_at: scannedAt,
+        },
+      }
+    ).catch(() => {});
+  }
+  return item;
+}
+
+function queueFullRelationshipEnrichment(userId, watchedItems) {
+  const key = String(userId);
+  if (relationshipEnrichmentJobs.has(key)) return;
+  const pending = (watchedItems || [])
+    .filter((item) => !relationMetadataIsFresh(item))
+    .sort((a, b) => relationScanPriority(b) - relationScanPriority(a));
+  if (!pending.length) return;
+
+  relationshipEnrichmentJobs.add(key);
+  setImmediate(async () => {
+    try {
+      // Keep this deliberately gentle: the foreground request gets a fast priority
+      // pass, while the remaining library is progressively indexed in MongoDB.
+      for (let i = 0; i < pending.length; i += 6) {
+        const chunk = pending.slice(i, i + 6);
+        await Promise.allSettled(chunk.map((item) => enrichRelationMetadata(item)));
+      }
+      invalidateUserRecommendationCache(userId);
+    } finally {
+      relationshipEnrichmentJobs.delete(key);
+    }
+  });
+}
+
+const GENERIC_RELATION_KEYWORDS = new Set([
+  "based on comic", "superhero", "sequel", "prequel", "spin off", "spin-off",
+  "family", "friendship", "murder", "police", "detective", "crime", "revenge",
+  "love", "romance", "violence", "death", "based on novel", "based on true story",
+  "woman director", "duringcreditsstinger", "aftercreditsstinger", "post credit scene",
+  "secret identity", "super power", "super powers", "hero", "villain", "future",
+  "space", "alien", "magic", "war", "new york city", "los angeles, california"
+]);
+
+function normalizeRelationKeywordName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isStrongUniverseKeyword(name, count) {
+  const normalized = normalizeRelationKeywordName(name);
+  if (!normalized || GENERIC_RELATION_KEYWORDS.has(normalized)) return false;
+  if (/cinematic universe|shared universe|universe \(|\buniverse\b|\bsaga\b|\bfranchise\b/.test(normalized)) return true;
+  if (/\bmarvel\b|\bdc\b|star wars|wizarding world|middle earth|middle-earth|star trek|transformers|james bond|mission impossible|planet of the apes/.test(normalized)) return true;
+  // A keyword recurring across many different watched titles is often a real world/
+  // franchise tag. Requiring four occurrences prevents generic one-off themes from
+  // becoming universe recommendations.
+  return count >= 4 && normalized.length >= 7 && normalized.split(" ").length <= 5;
+}
+
+function collectUniverseKeywordSignals(watchedItems) {
+  const keywordMap = new Map();
+  for (const item of watchedItems || []) {
+    for (const keyword of item.tmdb_relation_keywords || []) {
+      const id = Number(keyword?.id) || 0;
+      const name = String(keyword?.name || "").trim();
+      if (!id || !name) continue;
+      const entry = keywordMap.get(id) || { id, name, count: 0, source_titles: [] };
+      entry.count += 1;
+      if (item.title && entry.source_titles.length < 6 && !entry.source_titles.includes(item.title)) {
+        entry.source_titles.push(item.title);
+      }
+      keywordMap.set(id, entry);
+    }
+  }
+
+  return Array.from(keywordMap.values())
+    .filter((entry) => entry.count >= 2 && isStrongUniverseKeyword(entry.name, entry.count))
+    .map((entry) => {
+      const normalized = normalizeRelationKeywordName(entry.name);
+      const semanticBoost = /cinematic universe|shared universe|\buniverse\b/.test(normalized) ? 90
+        : /\bsaga\b|\bfranchise\b/.test(normalized) ? 55
+          : 25;
+      return { ...entry, signal_score: semanticBoost + Math.min(80, entry.count * 8) };
+    })
+    .sort((a, b) => b.signal_score - a.signal_score || b.count - a.count)
+    .slice(0, 24);
+}
+
+async function addUniverseDiscoverCandidates(candidateMap, signals) {
+  if (!Array.isArray(signals) || !signals.length) return;
+  const today = new Date().toISOString().slice(0, 10);
+
+  await mapWithConcurrency(signals, 4, async (signal) => {
+    const common = {
+      with_keywords: signal.id,
+      include_adult: "false",
+      page: 1,
+    };
+    const [movieResult, tvResult] = await Promise.allSettled([
+      tmdbGet("/discover/movie", {
+        ...common,
+        sort_by: "primary_release_date.desc",
+        "primary_release_date.lte": today,
+      }),
+      tmdbGet("/discover/tv", {
+        ...common,
+        sort_by: "first_air_date.desc",
+        "first_air_date.lte": today,
+      }),
+    ]);
+
+    const reason = `Connected to ${signal.name}`;
+    const sourceTitle = signal.source_titles?.[0] || "Your watch history";
+    const baseScore = 118 + Math.min(90, Number(signal.signal_score) || 0);
+
+    if (movieResult.status === "fulfilled") {
+      for (const [index, rec] of (movieResult.value.results || []).slice(0, 20).entries()) {
+        addCandidate(candidateMap, rec, "movie", {
+          score: baseScore - index * 0.7,
+          reason,
+          reasonType: "same_universe",
+          sourceTitle,
+        });
+      }
+    }
+    if (tvResult.status === "fulfilled") {
+      for (const [index, rec] of (tvResult.value.results || []).slice(0, 20).entries()) {
+        addCandidate(candidateMap, rec, "series", {
+          score: baseScore - index * 0.7,
+          reason,
+          reasonType: "same_universe",
+          sourceTitle,
+        });
+      }
+    }
+  });
+}
+
+async function addAllKnownCollectionContinuations(candidateMap, watchedItems) {
+  const collections = new Map();
+  for (const item of watchedItems || []) {
+    const id = Number(item.tmdb_collection_id) || 0;
+    if (!id) continue;
+    const entry = collections.get(id) || {
+      id,
+      name: item.tmdb_collection_name || "this film series",
+      source_titles: [],
+      strength: 0,
+    };
+    entry.strength += getSourceStrength(item);
+    if (item.title && entry.source_titles.length < 5 && !entry.source_titles.includes(item.title)) {
+      entry.source_titles.push(item.title);
+    }
+    collections.set(id, entry);
+  }
+
+  await mapWithConcurrency(Array.from(collections.values()), 5, async (collectionSignal) => {
+    const collection = await tmdbGet(`/collection/${collectionSignal.id}`);
+    const releasedParts = (collection.parts || [])
+      .filter((part) => isReleasedByToday(part.release_date))
+      .sort((a, b) => String(a.release_date || "").localeCompare(String(b.release_date || "")));
+    for (const [index, part] of releasedParts.entries()) {
+      addCandidate(candidateMap, part, "movie", {
+        score: 138 + Math.min(55, collectionSignal.strength / 4) - index * 0.2,
+        reason: `From ${collection.name || collectionSignal.name}`,
+        reasonType: "franchise_next",
+        sourceTitle: collectionSignal.source_titles[0] || "Your watch history",
+      });
+    }
+  });
+}
+
 function getAiredSeasons(details) {
   const today = new Date().toISOString().slice(0, 10);
   return (details?.seasons || [])
@@ -888,10 +1133,10 @@ function trimRecommendation(item) {
 async function buildRecommendationPayload(userId) {
   const [movies, series, genreMaps] = await Promise.all([
     Movie.find({ user_id: userId })
-      .select("_id user_id title release_year rating tmdb_id watch_status watch_date favorite rewatch_count order_number created_at updated_at")
+      .select("_id user_id title genre release_year rating tmdb_id tmdb_relation_keywords tmdb_collection_id tmdb_collection_name tmdb_relation_scanned_at watch_status watch_date favorite rewatch_count order_number created_at updated_at")
       .lean(),
     Series.find({ user_id: userId })
-      .select("_id user_id title release_year rating tmdb_id watch_status watch_date favorite rewatch_count order_number number_of_seasons watched_seasons created_at updated_at")
+      .select("_id user_id title genre release_year rating tmdb_id tmdb_relation_keywords tmdb_collection_id tmdb_collection_name tmdb_relation_scanned_at watch_status watch_date favorite rewatch_count order_number number_of_seasons watched_seasons created_at updated_at")
       .lean(),
     getGenreNameMaps().catch(() => ({ movie: new Map(), series: new Map() })),
   ]);
@@ -905,6 +1150,26 @@ async function buildRecommendationPayload(userId) {
     .sort((a, b) => getSourceStrength(b) - getSourceStrength(a));
 
   const candidateMap = new Map();
+
+  // Relationship coverage deliberately looks beyond the small taste-anchor budget.
+  // We synchronously enrich the highest-value missing records so the first request can
+  // discover major universes immediately, then progressively index EVERY remaining
+  // watched title in the background and persist the graph metadata in MongoDB.
+  const missingRelationMetadata = watchedItems
+    .filter((item) => !relationMetadataIsFresh(item))
+    .sort((a, b) => relationScanPriority(b) - relationScanPriority(a));
+  await mapWithConcurrency(
+    missingRelationMetadata.slice(0, RELATION_SYNC_SCAN_LIMIT),
+    8,
+    async (item) => enrichRelationMetadata(item)
+  );
+  queueFullRelationshipEnrichment(userId, watchedItems);
+
+  const universeSignals = collectUniverseKeywordSignals(watchedItems);
+  await Promise.all([
+    addUniverseDiscoverCandidates(candidateMap, universeSignals),
+    addAllKnownCollectionContinuations(candidateMap, watchedItems),
+  ]);
 
   // Series progress is checked across the whole watched/watching series history, not
   // only the handful of titles used as taste anchors. This is what lets the engine
@@ -1116,12 +1381,16 @@ async function buildRecommendationPayload(userId) {
 
   const continueStory = take(
     (item) => item.reason_types.includes("new_season") || item.reason_types.includes("franchise_next"),
-    14
+    60
   );
-  const fromVault = take((item) => item.in_vault, 14);
+  const fromVault = take((item) => item.in_vault, 80);
+  const connectedUniverses = take(
+    (item) => item.reason_types.includes("same_universe"),
+    100
+  );
   const newReleases = take(
     (item) => !item.in_vault && item.is_recent_release,
-    14,
+    60,
     (items) => items.sort((a, b) => {
       const yearDiff = (Number(b.release_year) || 0) - (Number(a.release_year) || 0);
       if (yearDiff) return yearDiff;
@@ -1129,7 +1398,7 @@ async function buildRecommendationPayload(userId) {
       return dateDiff || (Number(b.score) || 0) - (Number(a.score) || 0);
     })
   );
-  const becauseYouWatched = take((item) => !item.in_vault, 18);
+  const becauseYouWatched = take((item) => !item.in_vault, 100);
 
   return {
     generated_at: new Date().toISOString(),
@@ -1143,13 +1412,17 @@ async function buildRecommendationPayload(userId) {
     sections: {
       continue_story: continueStory,
       from_vault: fromVault,
+      connected_universes: connectedUniverses,
       new_releases: newReleases,
       because_you_watched: becauseYouWatched,
     },
     meta: {
-      recommendation_version: 2,
+      recommendation_version: 3,
       cached_for_ms: RECOMMENDATION_CACHE_TTL_MS,
       source_titles_used: sourceItems.length,
+      relationship_titles_indexed: watchedItems.filter((item) => relationMetadataIsFresh(item)).length,
+      relationship_titles_total: watchedItems.length,
+      universe_signals_found: universeSignals.length,
     },
   };
 }
