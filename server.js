@@ -516,6 +516,11 @@ const TMDB_CACHE_TTL_MS = Math.max(
 );
 const recommendationCache = new Map();
 const tmdbResponseCache = new Map();
+const universeSearchCache = new Map();
+const UNIVERSE_SEARCH_CACHE_TTL_MS = Math.max(
+  5 * 60_000,
+  Number(process.env.UNIVERSE_SEARCH_CACHE_TTL_MS) || 30 * 60_000
+);
 let genreNameMapsPromise = null;
 
 function recommendationCacheKey(userId) {
@@ -523,7 +528,12 @@ function recommendationCacheKey(userId) {
 }
 
 function invalidateUserRecommendationCache(userId) {
-  recommendationCache.delete(recommendationCacheKey(userId));
+  const userKey = recommendationCacheKey(userId);
+  recommendationCache.delete(userKey);
+  const searchPrefix = `${userKey}:`;
+  for (const key of universeSearchCache.keys()) {
+    if (key.startsWith(searchPrefix)) universeSearchCache.delete(key);
+  }
 }
 
 function getCachedRecommendation(userId) {
@@ -1127,6 +1137,388 @@ function trimRecommendation(item) {
     match_score: Math.min(96, Math.max(60, displayMatch)),
     reasons: item.reasons.slice(0, 3),
     source_titles: item.source_titles.slice(0, 4),
+  };
+}
+
+
+// ==================== Smart universe / franchise search ====================
+// This search is intentionally separate from the personalized feed. It understands
+// common universe aliases (Marvel/MCU, DC/DCU, etc.), combines TMDB keyword/company
+// discovery with relationship metadata learned from the user's own vault, and keeps
+// watched titles visible with an explicit status instead of silently dropping them.
+
+const SMART_UNIVERSE_ALIASES = [
+  {
+    key: "marvel",
+    label: "Marvel / MCU",
+    aliases: ["marvel", "mcu", "marvel cinematic universe", "avengers"],
+    keywordTerms: ["marvel cinematic universe", "marvel comics"],
+    companyTerms: ["marvel studios", "marvel television", "marvel entertainment"],
+  },
+  {
+    key: "dc",
+    label: "DC / DCU",
+    aliases: ["dc", "dcu", "dceu", "dc universe", "dc extended universe"],
+    keywordTerms: ["dc universe", "dc extended universe", "dc comics"],
+    companyTerms: ["dc studios", "dc entertainment"],
+  },
+  {
+    key: "star-wars",
+    label: "Star Wars",
+    aliases: ["star wars", "starwars"],
+    keywordTerms: ["star wars", "star wars universe"],
+    companyTerms: ["lucasfilm"],
+  },
+  {
+    key: "wizarding-world",
+    label: "Wizarding World",
+    aliases: ["harry potter", "wizarding world", "fantastic beasts"],
+    keywordTerms: ["wizarding world", "harry potter"],
+    companyTerms: ["heyday films"],
+  },
+  {
+    key: "middle-earth",
+    label: "Middle-earth",
+    aliases: ["lord of the rings", "lotr", "middle earth", "middle-earth", "hobbit"],
+    keywordTerms: ["middle-earth", "middle earth", "the lord of the rings"],
+    companyTerms: [],
+  },
+  {
+    key: "star-trek",
+    label: "Star Trek",
+    aliases: ["star trek", "startrek"],
+    keywordTerms: ["star trek"],
+    companyTerms: [],
+  },
+  {
+    key: "transformers",
+    label: "Transformers",
+    aliases: ["transformers", "autobots", "decepticons"],
+    keywordTerms: ["transformers"],
+    companyTerms: ["hasbro entertainment"],
+  },
+];
+
+function normalizedSmartSearch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function interpretUniverseSearch(rawQuery) {
+  const query = String(rawQuery || "").trim().slice(0, 80);
+  const normalized = normalizedSmartSearch(query);
+  const known = SMART_UNIVERSE_ALIASES.find((entry) =>
+    entry.aliases.some((alias) => {
+      const normalizedAlias = normalizedSmartSearch(alias);
+      return normalized === normalizedAlias || normalized.includes(normalizedAlias) || normalizedAlias.includes(normalized);
+    })
+  );
+
+  if (known) {
+    return {
+      query,
+      normalized,
+      key: known.key,
+      label: known.label,
+      known: true,
+      keywordTerms: [...known.keywordTerms],
+      companyTerms: [...known.companyTerms],
+      matchTerms: Array.from(new Set([...known.aliases, ...known.keywordTerms, ...known.companyTerms])).map(normalizedSmartSearch),
+    };
+  }
+
+  return {
+    query,
+    normalized,
+    key: normalized || "search",
+    label: query,
+    known: false,
+    keywordTerms: Array.from(new Set([query, `${query} universe`, `${query} franchise`])).filter(Boolean),
+    companyTerms: [query].filter(Boolean),
+    matchTerms: [normalized],
+  };
+}
+
+function smartNameRelevance(name, interpretation) {
+  const normalized = normalizedSmartSearch(name);
+  if (!normalized) return 0;
+  let best = 0;
+  for (const term of interpretation.matchTerms || []) {
+    if (!term) continue;
+    if (normalized === term) best = Math.max(best, 100);
+    else if (normalized.includes(term) || term.includes(normalized)) best = Math.max(best, 76);
+    else {
+      const queryWords = new Set(term.split(" ").filter(Boolean));
+      const nameWords = normalized.split(" ").filter(Boolean);
+      const overlap = nameWords.filter((word) => queryWords.has(word)).length;
+      if (overlap) best = Math.max(best, 35 + overlap * 10);
+    }
+  }
+  return best;
+}
+
+function getUniverseSearchCache(userId, interpretation) {
+  const key = `${String(userId)}:${interpretation.key}:${interpretation.normalized}`;
+  const entry = universeSearchCache.get(key);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    universeSearchCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setUniverseSearchCache(userId, interpretation, value) {
+  const key = `${String(userId)}:${interpretation.key}:${interpretation.normalized}`;
+  universeSearchCache.set(key, { value, expiresAt: Date.now() + UNIVERSE_SEARCH_CACHE_TTL_MS });
+  while (universeSearchCache.size > 300) universeSearchCache.delete(universeSearchCache.keys().next().value);
+}
+
+async function searchTmdbNamedEntities(path, terms, interpretation, limit = 8) {
+  const responses = await mapWithConcurrency(
+    Array.from(new Set((terms || []).filter(Boolean))).slice(0, 4),
+    3,
+    async (term) => tmdbGet(path, { query: term })
+  );
+  const map = new Map();
+  for (const response of responses) {
+    if (response?.__error) continue;
+    for (const entity of response?.results || []) {
+      const id = Number(entity?.id) || 0;
+      const name = String(entity?.name || entity?.title || "").trim();
+      if (!id || !name) continue;
+      const relevance = smartNameRelevance(name, interpretation);
+      if (relevance < (interpretation.known ? 30 : 45)) continue;
+      const current = map.get(id);
+      if (!current || relevance > current.relevance) map.set(id, { id, name, relevance });
+    }
+  }
+  return Array.from(map.values())
+    .sort((a, b) => b.relevance - a.relevance)
+    .slice(0, limit);
+}
+
+function addUniverseSearchCandidate(map, raw, mediaType, { score = 0, reason = "", source = "discovery" } = {}) {
+  if (!raw?.id || raw.adult === true) return;
+  const base = candidateFromTmdb(raw, mediaType);
+  const key = `${mediaType}:${base.tmdb_id}`;
+  const current = map.get(key) || {
+    ...base,
+    score: 0,
+    reasons: [],
+    reason_types: ["universe_search"],
+    source_titles: [],
+    search_sources: [],
+    progress: null,
+  };
+  current.score += Number(score) || 0;
+  if (reason && !current.reasons.includes(reason)) current.reasons.push(reason);
+  if (source && !current.search_sources.includes(source)) current.search_sources.push(source);
+  if (!current.poster_url && base.poster_url) current.poster_url = base.poster_url;
+  if (!current.backdrop_url && base.backdrop_url) current.backdrop_url = base.backdrop_url;
+  if (!current.overview && base.overview) current.overview = base.overview;
+  current.tmdb_rating = Math.max(Number(current.tmdb_rating) || 0, Number(base.tmdb_rating) || 0);
+  current.popularity = Math.max(Number(current.popularity) || 0, Number(base.popularity) || 0);
+  map.set(key, current);
+}
+
+async function addDiscoverPagesToUniverseSearch(candidateMap, mediaType, params, { score, reason, source, pages = 2 } = {}) {
+  const endpoint = mediaType === "movie" ? "/discover/movie" : "/discover/tv";
+  const dateField = mediaType === "movie" ? "primary_release_date" : "first_air_date";
+  const requests = [];
+  for (let page = 1; page <= pages; page += 1) {
+    requests.push(tmdbGet(endpoint, { ...params, page, sort_by: "popularity.desc" }));
+  }
+  // A newest-first pass makes newly released chapters discoverable even when their
+  // popularity has not caught up with older franchise entries yet.
+  requests.push(tmdbGet(endpoint, { ...params, page: 1, sort_by: `${dateField}.desc` }));
+  const responses = await Promise.allSettled(requests);
+  responses.forEach((result, responseIndex) => {
+    if (result.status !== "fulfilled") return;
+    for (const [itemIndex, raw] of (result.value.results || []).entries()) {
+      addUniverseSearchCandidate(candidateMap, raw, mediaType, {
+        score: (Number(score) || 0) - responseIndex * 2 - itemIndex * 0.12,
+        reason,
+        source,
+      });
+    }
+  });
+}
+
+async function buildUniverseSearchPayload(userId, rawQuery) {
+  const interpretation = interpretUniverseSearch(rawQuery);
+  if (interpretation.normalized.length < 2) {
+    const error = new Error("Search needs at least 2 characters");
+    error.status = 400;
+    throw error;
+  }
+
+  const [movies, series, genreMaps] = await Promise.all([
+    Movie.find({ user_id: userId })
+      .select("title release_year tmdb_id tmdb_relation_keywords watch_status order_number rating poster_url")
+      .lean(),
+    Series.find({ user_id: userId })
+      .select("title release_year tmdb_id tmdb_relation_keywords watch_status order_number rating poster_url number_of_seasons watched_seasons")
+      .lean(),
+    getGenreNameMaps().catch(() => ({ movie: new Map(), series: new Map() })),
+  ]);
+  const allVaultItems = [
+    ...movies.map((item) => ({ ...item, media_type: "movie" })),
+    ...series.map((item) => ({ ...item, media_type: "series" })),
+  ];
+  const vaultLookup = makeVaultLookup(movies, series);
+
+  // Relationship keywords already learned from the user's library are the fastest
+  // and strongest signal, so use them before asking TMDB to interpret the query.
+  const localKeywordMap = new Map();
+  for (const item of allVaultItems) {
+    for (const keyword of item.tmdb_relation_keywords || []) {
+      const relevance = smartNameRelevance(keyword?.name, interpretation);
+      const id = Number(keyword?.id) || 0;
+      if (!id || relevance < 35) continue;
+      const current = localKeywordMap.get(id);
+      if (!current || relevance > current.relevance) {
+        localKeywordMap.set(id, { id, name: keyword.name, relevance, fromVault: true });
+      }
+    }
+  }
+
+  const [keywordSignals, companySignals] = await Promise.all([
+    searchTmdbNamedEntities("/search/keyword", interpretation.keywordTerms, interpretation, 8).catch(() => []),
+    searchTmdbNamedEntities("/search/company", interpretation.companyTerms, interpretation, 6).catch(() => []),
+  ]);
+
+  for (const signal of keywordSignals) {
+    const current = localKeywordMap.get(signal.id);
+    if (!current || signal.relevance > current.relevance) localKeywordMap.set(signal.id, signal);
+  }
+
+  const keywords = Array.from(localKeywordMap.values())
+    .sort((a, b) => (b.fromVault ? 1 : 0) - (a.fromVault ? 1 : 0) || b.relevance - a.relevance)
+    .slice(0, 8);
+  const companies = companySignals.slice(0, 6);
+  const candidateMap = new Map();
+  const discoveryJobs = [];
+  const humanLabel = interpretation.label || interpretation.query;
+
+  if (keywords.length) {
+    const ids = keywords.map((item) => item.id).join("|");
+    const params = { with_keywords: ids, include_adult: "false" };
+    discoveryJobs.push(
+      addDiscoverPagesToUniverseSearch(candidateMap, "movie", params, {
+        score: 210,
+        reason: `Connected to ${humanLabel}`,
+        source: "keyword",
+        pages: 3,
+      }),
+      addDiscoverPagesToUniverseSearch(candidateMap, "series", params, {
+        score: 210,
+        reason: `Connected to ${humanLabel}`,
+        source: "keyword",
+        pages: 3,
+      })
+    );
+  }
+
+  if (companies.length) {
+    const ids = companies.map((item) => item.id).join("|");
+    const params = { with_companies: ids, include_adult: "false" };
+    discoveryJobs.push(
+      addDiscoverPagesToUniverseSearch(candidateMap, "movie", params, {
+        score: 165,
+        reason: `From ${humanLabel}'s connected studios`,
+        source: "company",
+        pages: 2,
+      }),
+      addDiscoverPagesToUniverseSearch(candidateMap, "series", params, {
+        score: 165,
+        reason: `From ${humanLabel}'s connected studios`,
+        source: "company",
+        pages: 2,
+      })
+    );
+  }
+
+  // For a custom universe/franchise query that TMDB cannot map to a known keyword or
+  // company, fall back to multi-search instead of returning a dead search box.
+  if (!interpretation.known || (!keywords.length && !companies.length)) {
+    discoveryJobs.push((async () => {
+      const responses = await Promise.allSettled([
+        tmdbGet("/search/multi", { query: interpretation.query, include_adult: "false", page: 1 }),
+        tmdbGet("/search/multi", { query: interpretation.query, include_adult: "false", page: 2 }),
+      ]);
+      for (const result of responses) {
+        if (result.status !== "fulfilled") continue;
+        for (const raw of result.value.results || []) {
+          const type = raw.media_type === "tv" ? "series" : raw.media_type === "movie" ? "movie" : null;
+          if (!type) continue;
+          addUniverseSearchCandidate(candidateMap, raw, type, {
+            score: 118,
+            reason: `Matches ${humanLabel}`,
+            source: "title_search",
+          });
+        }
+      }
+    })());
+  }
+
+  await Promise.allSettled(discoveryJobs);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const results = [];
+  for (const candidate of candidateMap.values()) {
+    const vaultItem = vaultLookup.find(candidate);
+    candidate.in_vault = Boolean(vaultItem);
+    candidate.vault_order_number = vaultItem ? Number(vaultItem.order_number) || null : null;
+    candidate.vault_watch_status = vaultItem?.watch_status || null;
+    candidate.vault_rating = vaultItem ? Number(vaultItem.rating) || 0 : null;
+    candidate.is_watched = Boolean(vaultItem && itemCountsAsWatched(vaultItem));
+    candidate.is_upcoming = Boolean(candidate.release_date && String(candidate.release_date) > today);
+    candidate.primary_reason = candidate.reasons[0] || `Connected to ${humanLabel}`;
+    candidate.primary_reason_type = "universe_search";
+    candidate.genres = candidate.genre_ids
+      .map((id) => genreMaps[candidate.media_type]?.get(Number(id)))
+      .filter(Boolean)
+      .slice(0, 4);
+    if (!candidate.poster_url && vaultItem?.poster_url) candidate.poster_url = vaultItem.poster_url;
+    // Multiple independent signals dramatically increase confidence.
+    candidate.score += Math.min(90, Math.max(0, candidate.search_sources.length - 1) * 28);
+    const trimmed = trimRecommendation(candidate);
+    trimmed.__universe_search = true;
+    results.push(trimmed);
+  }
+
+  results.sort((a, b) => {
+    const scoreDiff = (Number(b.score) || 0) - (Number(a.score) || 0);
+    if (scoreDiff) return scoreDiff;
+    const dateDiff = String(b.release_date || "").localeCompare(String(a.release_date || ""));
+    if (dateDiff) return dateDiff;
+    return (Number(b.popularity) || 0) - (Number(a.popularity) || 0);
+  });
+
+  return {
+    query: interpretation.query,
+    interpreted_as: humanLabel,
+    universe_key: interpretation.key,
+    known_universe: interpretation.known,
+    generated_at: new Date().toISOString(),
+    results,
+    stats: {
+      total: results.length,
+      movies: results.filter((item) => item.media_type === "movie").length,
+      series: results.filter((item) => item.media_type === "series").length,
+      watched: results.filter((item) => item.is_watched).length,
+      unwatched: results.filter((item) => !item.is_watched).length,
+      upcoming: results.filter((item) => item.is_upcoming).length,
+    },
+    signals: {
+      keywords: keywords.map(({ id, name }) => ({ id, name })),
+      companies: companies.map(({ id, name }) => ({ id, name })),
+    },
   };
 }
 
@@ -2048,6 +2440,36 @@ app.get("/api/social/friends/:username/vault", authMiddleware, async (req, res) 
 });
 
 // ==================== Recommendations ====================
+
+
+app.get("/api/recommendations/search", authMiddleware, async (req, res) => {
+  const interpretation = interpretUniverseSearch(req.query.q);
+  if (interpretation.normalized.length < 2) {
+    return res.status(400).json({ error: "Search needs at least 2 characters" });
+  }
+
+  const forceRefresh = String(req.query.refresh || "") === "1";
+  if (!forceRefresh) {
+    const cached = getUniverseSearchCache(req.userId, interpretation);
+    if (cached) {
+      res.set("X-Universe-Search-Cache", "HIT");
+      return res.json(cached);
+    }
+  }
+
+  try {
+    const payload = await buildUniverseSearchPayload(req.userId, interpretation.query);
+    setUniverseSearchCache(req.userId, interpretation, payload);
+    res.set("X-Universe-Search-Cache", "MISS");
+    res.json(payload);
+  } catch (error) {
+    console.error("Universe search error:", error);
+    res.status(error.status || 502).json({
+      error: error.status === 400 ? error.message : "Could not search this universe right now",
+      detail: process.env.NODE_ENV === "production" ? undefined : error.message,
+    });
+  }
+});
 
 app.get("/api/recommendations", authMiddleware, async (req, res) => {
   const forceRefresh = String(req.query.refresh || "") === "1";

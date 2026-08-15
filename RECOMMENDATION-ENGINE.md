@@ -36,3 +36,7 @@ Optional environment variables:
 - `TMDB_CACHE_TTL_MS`
 
 Use `?refresh=1` on `/api/recommendations` to force a fresh recommendation build.
+
+## Smart universe search
+
+`GET /api/recommendations/search?q=Marvel` performs an authenticated universe/franchise search. It understands common aliases such as Marvel/MCU and DC/DCU, combines TMDB keyword/company discovery with relationship keywords already learned from the user's vault, returns both movies and series, and keeps watched titles in the result with an explicit watched state so the user can see the complete connected catalog. Results are cached per-user/per-query and invalidated when the user's vault changes.
