@@ -968,9 +968,23 @@ async function buildRecommendationPayload(userId) {
     });
   });
 
-  // A smaller set of strong taste anchors keeps recommendation calls fast while the
-  // dedicated progress pass above still covers every tracked series.
-  const sourceItems = watchedItems.slice(0, 12);
+  // Keep taste anchors balanced across movies and series. Without this, a user with
+  // many highly-rated shows could spend the entire source budget on TV and the For You
+  // feed would look series-only even when their movie history is substantial.
+  const movieAnchors = watchedItems.filter((item) => item.media_type === "movie").slice(0, 6);
+  const seriesAnchors = watchedItems.filter((item) => item.media_type === "series").slice(0, 6);
+  const balancedAnchorKeys = new Set(
+    [...movieAnchors, ...seriesAnchors].map((item) => `${item.media_type}:${String(item._id || item.title)}`)
+  );
+  const sourceItems = [...movieAnchors, ...seriesAnchors];
+  for (const item of watchedItems) {
+    if (sourceItems.length >= 12) break;
+    const key = `${item.media_type}:${String(item._id || item.title)}`;
+    if (balancedAnchorKeys.has(key)) continue;
+    balancedAnchorKeys.add(key);
+    sourceItems.push(item);
+  }
+  sourceItems.sort((a, b) => getSourceStrength(b) - getSourceStrength(a));
   await mapWithConcurrency(sourceItems, 4, async (item) => {
     item.tmdb_id = await resolveMediaTmdb(item, item.media_type);
     return item;
@@ -1133,7 +1147,7 @@ async function buildRecommendationPayload(userId) {
       because_you_watched: becauseYouWatched,
     },
     meta: {
-      recommendation_version: 1,
+      recommendation_version: 2,
       cached_for_ms: RECOMMENDATION_CACHE_TTL_MS,
       source_titles_used: sourceItems.length,
     },
